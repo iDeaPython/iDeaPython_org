@@ -1,0 +1,375 @@
+'''
+This is microMG, MG = message, go!
+'''
+
+import socket
+import network
+from machine import reset
+from lib.COMMON.timer import Timer
+from machine import Pin
+
+sta = network.WLAN( network.STA_IF )
+sta.active( 1 )
+
+class collector():
+    def __init__(self, apparatus,
+                 H_CH='', HSlen=10, isSendRepeat=1, Slot=1, askShip=1, test=0): #h_CH=1...5
+        # program start
+        self.test=test
+        self.Slot=Slot
+        # self.ID = 'ID' + '%04d' % apparatus.ID
+        if HSlen == 'car':
+            HSlen = 7
+        self.Ship=askShip
+        import time
+        self.randomDelay_askship = time.ticks_us() % 1000
+        if Slot==1:
+            self.slotToGPIO={}
+            self.btnToGPIO={}
+            for i in range(1, apparatus.SlotTotal + 1):
+                self.slotToGPIO.update( {i: Pin( apparatus.__dict__.get( 'Slot' + str( i ) ), mode=Pin.OUT )} )
+            # SWITCH
+            from lib.ASSEMBLE.GPIO.Switch import switch
+            self.switch = switch( self.slotToGPIO )
+        try:
+            apparatus.BtnTotal
+            for i in range(1, apparatus.BtnTotal + 1):
+                self.btnToGPIO.update( {i: Pin( apparatus.__dict__.get( 'Btn' + str( i ) ),mode=Pin.IN,pull=Pin.PULL_UP)} )
+            from lib.ASSEMBLE.Button.Btn import Button
+            self.btn = Button (self.btnToGPIO, self.slotToGPIO)
+        except:
+            pass
+        self.switchlen = 21
+        self.shake_port = 700
+        self.H_port = [801, 802, 803, 804, 805]
+        # self.competition_port = 900
+        self.regular_port = 1000
+        self.H_failCount = 0
+        # self.LData_len = Ldatalen # I DON'T USE THIS YET.
+        self.HdataLen_str = '%04d' % HSlen
+        self.Hcheck = ''.join(['*' for i in range(HSlen)])
+        self.shakeData_len = 6
+        self.switchOfflineCount = 0
+        self.isHighSpeed = 0
+        self.askshipConn = None
+        # import time
+        # self.ran_CL = (time.ticks_us() % 100) * 2
+        # self.CLtime_ms = Ltime if Ltime >= 1000 else 1000
+        self.isHalfduplex_recv = 1
+        self.Latest_Hdata=None
+        self.RunAfter = Timer.RunAfter
+        self.isSendRepeat=isSendRepeat
+        # self.Assisting=0
+        self.counter = 0
+        self.ssid=apparatus.ssid
+        self.passwd=apparatus.passwd
+        self.name=apparatus.__name__
+        self.UPDrecv=None
+        # connect to WIFI , then socket
+        if sta.isconnected() == 0:
+            sta.ifconfig( (apparatus.IPprefix + str( apparatus.ID ), '255.255.255.0', apparatus.IPprefix + '1', apparatus.IPprefix + '1') ) # manually assign IP addr, but No ID in management.py, so cancel.
+            self.connectwifi(sta, self.ssid, self.passwd)
+        else:
+            print( 'WIFI has already CONNECTED' )
+
+        # CREATE SHAKEDATA
+        if H_CH != '':
+            print('HS MODE')
+            self.highSpeed_port = self.H_port[H_CH-1]
+            # self.shakeData = '%04d' % apparatus.ID + 'H' + str(H_CH-1)
+            self.shakeData = self.ID + 'H' + str(H_CH-1)
+        elif Slot == 1: # it will go to ask ship to update GPIO status.
+            print( 'Slot MODE' )
+            # globals()['i' + '%04d' % apparatus.ID + 'runtimes'] = 0  # for what? i try to find "runtimes", but nothing can ben found, not yet
+            # self.shakeData = '%04d' % apparatus.ID + 'S_'
+            self.shakeData =  self.ID +'S_'
+        else: # LOW SPEED SHAKEDATA
+            print( 'pure LS MODE' )
+            self.shakeData =  self.ID +'L_'
+        # del (self.ID)
+
+        # IF HIGH SPEED, send data to ship right now. However, low speed needn't send data to ship now.
+        # How about that, low speed send data too.
+        if H_CH != '':
+            # SEND SHAKE DATA
+            self.sendUDP(port=self.shake_port, data=self.shakeData)
+            print( 'sent self.shakeData : ' + self.shakeData )
+
+            # SEND THE LENGTH OF HIGHSPEED, WAIT UNTIL RECEIVE STR: 'OK'
+            # conn, recvData = self.verifyTCP( self.HdataLen_str, 8000 )
+            recvData = self.verifyTCP(self.HdataLen_str, 8000, returnConn=0)
+            if recvData == 'OK':
+                print( 'trying connect to high speed port: ' + str( self.highSpeed_port ) )
+                self.H_clientSocket = self.return_conn(int(self.highSpeed_port))
+                if self.H_clientSocket != 1:
+                    self.isHighSpeed = 1
+                    self.H_clientSocket.settimeout( 0.1 )
+                else:
+                    print( '\n\nH_clientSocket is 1\n\n' )
+                # conn.close()
+            else:
+                print( ' can not receive the response from high speed port 8000 ' )
+                Timer.delayMS(5000)
+                reset()
+
+    def connectwifi(self, station, ssid, password,recv=''):
+        if self.counter>=5:
+            if Timer.RunAfter('tryWIFI_10000'):
+                if station.isconnected()==0:
+                    station.connect(ssid, password)
+                    print(' is trying to connect WIFI')
+                    Timer.delayMS(4000)
+        else:
+            station.disconnect()
+            while station.isconnected() == 0 and self.counter<=5:
+                Timer.delayMS(1000)
+                print(' is trying to connect WIFI')
+                station.connect(ssid, password)
+                Timer.delayMS(4000)
+                self.counter += 1
+
+            while station.isconnected() == 1 and recv[-2:]!='__': # ask ID from ship
+                recv = self.verifyTCP('0000__', self.shake_port,returnConn=0)
+                self.ID = recv[:4]
+                print('receive shakeData:', recv)
+                # conn.close()
+                # if counter >= 5 or station.isconnected() == 0:
+            # print('can not find the AP , go to sleep now!')
+
+    def sendUDP(self, port, data, recv=0):
+        count = 0
+        while 1:
+            if self.UPDrecv!=None:
+                r=self._recv_data(self.UPDrecv, 16)
+                self.UPDrecv.close()
+                self.UPDrecv=None
+                return r
+            try:
+                conn = socket.socket()
+                conn.connect( ('192.168.4.1', port) )
+                conn.send( data.encode() )
+                if recv==1:
+                    self.UPDrecv = conn
+                else:
+                    conn.close()
+                break
+            except:
+                count += 1
+                Timer.delayMS(800)
+                print( 'UDP data can not send:', data )
+                if count > 6:
+                    # uos.dupterm(uart, 1)  # for moment when test
+                    reset()  # for moment when officially start to use
+
+    # DEL
+    def DoneSwitchconn(self):
+        try:
+            self.askshipConn.close()
+            self.askshipConn=None
+            print ('switchConn close succeed')
+        except:
+            print ('switchConn close failed')
+            pass
+        self.switchOfflineCount=0
+        self.isHalfduplex_recv=1
+
+    # DEL
+    def verifyTCP(self, data, port, askship=0, LS=0, mode='waiting', returnConn=1): # halfduplex means: send data in this round, receive data in next round, high speed will wait for receiving.
+        if self.isHalfduplex_recv == 1: # "isHalfduplex_recv" only for SWITCH MODE
+            conn = self.return_conn(int(port))
+            if conn != 0:
+                conn.send(data.encode())
+            else:
+                # if self.test:
+                #     print ('get conn of verifyTCP failed')
+                self.DoneSwitchconn()
+                return 1, 1
+        else:
+            conn = self.askshipConn
+        if conn != 0:
+            if mode == 'waiting':
+                conn.settimeout( 6 )
+            elif mode == 'halfduplex' and self.isHalfduplex_recv == 1:
+                conn.settimeout( 0 )
+                self.isHalfduplex_recv = not self.isHalfduplex_recv
+                return conn, 'responding'
+            elif mode == 'halfduplex':
+                self.isHalfduplex_recv = not self.isHalfduplex_recv
+            recv = self._recv_data( conn, self.shakeData_len  + self.switchlen )  # receive: NO, OFF, OK, CHECK,
+            if returnConn!=1:
+                conn.close()
+                return recv
+            return conn, recv
+
+    # DEL
+    def return_conn(self, port):
+        count = 0
+        while count < 5:
+            try:
+                conn1 = socket.socket()
+                conn1.connect( ('192.168.4.1', port) )
+                return conn1
+            except:
+                count += 1
+            Timer.delayMS(750) #
+        print( 'can not connect to server port: ' + str( port ) )
+        self.connectwifi(sta, self.ssid, self.passwd)
+        return 0
+
+    # DEL
+    def _recv_data(self, conn, length):
+        try:
+            recv = conn.recv( length ).decode()
+            if recv == '':# for test, able to be deleted.
+                if self.test:
+                    print( 'receive empty, try again' ) # for test, able to be deleted.
+        except:
+            recv = '_'
+            if self.test:
+                print ('NO data can be received, so it will be _')
+        return recv
+
+    # def _send_data(self, conn, str):
+    #     conn.send( str.encode() )
+
+    def askAssist(self,cmd): # api
+        name,cmd=cmd.split('!')
+        if '!' not in name:
+            # self.Assisting= 1
+            self.send('assist'+name+'!'+cmd) # send it as low speed
+        else:
+            if self.test:
+                print ('Please Delete "!" from your name!')
+
+    def remoteLink(self, btn, slot, name): # api
+        # data = 'Btn1,2_Slot2,3;name'
+        data= 'Btn'+','.join(str(i) for i in btn)+'Slot'+','.join(str(i) for i in slot)+'@'+name
+        self.send(data) # send it as low speed
+
+    def askShip(self): # the unique channel of connect with ship
+        recvData = ''
+        if self.RunAfter( self.name + '_' + str( 800 + self.randomDelay_askship)):
+            while recvData=='':
+                if self.RunAfter('tryRecv_450'):
+                    if self.switchOfflineCount > 7: # if can't recv data over 7times, send 'check' to server to prove not offline.
+                        self.askshipConn, recvData = self.verifyTCP(self.shakeData + 'check', self.regular_port,
+                                                                    mode='halfduplex')
+                    else:
+                        self.askshipConn, recvData = self.verifyTCP(self.shakeData,
+                                                                    self.regular_port, mode='halfduplex')
+                        if self.test:
+                            print( 'Non-Responsed-Times is : ' + str(self.switchOfflineCount))
+            if recvData not in ('receiving', '_', 1):
+                self.askshipConn.close()
+                if recvData == 'offlined':
+                    print('received offlined')
+                    reset()
+                rawdata = recvData[self.shakeData_len:]  # rawdata in GPIO is 0 or 1
+                if self.test:
+                    print ('\nRecv DATA: ', recvData,'\n')
+
+                if rawdata[:3]=='Btn' and 'Slot' in (rawdata): # For remote Link
+                    B,S=rawdata.replace('Btn','').replace('Slot','').split('_')
+                    Btn=B.split(',')
+                    Slot=S.split(',')
+                    self.btn.addlink(Btn,Slot)
+                else:  # For SWITCH
+                    unique_ID = recvData[:4]
+                    if unique_ID == self.ID[2:]:
+                        self.switchOfflineCount = 0
+                        if rawdata == 'check':
+                            self.switchOfflineCount = 0
+                        elif ':' in rawdata: # ":" appears, it means CMD str
+                            return rawdata  # Switch.py needs this, laser means gpio on board, not only for the laser sword
+                        else:
+                            b = rawdata.split( ',' ) # "comma" means split two cmds, but "comma" may never has been used, it was the old way, delete this part? checked 1 time, it can be deleted.
+                            for i in range( len( b ) ):
+                                self.slotToGPIO[int( b[i].split( '-' )[0] )].value( int( b[i].split( '-' )[1] ) )
+            # else:
+            #     self.switchOfflineCount += 1
+            #     if self.switchOfflineCount > 24:
+            #         if self.test:
+            #             print ('recvData: ',recvData)
+            #             print( ' set GPIO be offline' )
+
+
+    def send(self,data,interval=1000): # api
+        if interval<500:
+            interval=500
+        if self.isHighSpeed:
+            if self.RunAfter(self.name + '_50'):
+                try:
+                    if self.isSendRepeat or data != self.Latest_Hdata:
+                        self.Latest_Hdata = data
+                        self.H_clientSocket.send(self.Latest_Hdata.encode())
+                        self.H_failCount = 0
+                    # elif self.RunAfter(self.ID + 'HC_14000'):
+                    elif self.RunAfter(self.name + 'HC_14000'):
+                        self.H_clientSocket.send(self.Hcheck)
+                except:
+                    Timer.delayMS(700)
+                    self.H_failCount += 1
+                    print(' Highspeed data can not send.')
+                    if self.H_failCount > 8:
+                        # self.isHighSpeed = 0
+                        # print('isHighSpeed 0')
+                        # return 1  # for moment when test
+                        for i in reversed(range(1,6)):
+                            Timer.delayMS(1000)
+                            print ('after', i, 'sec will be reboot')
+                        reset()  # for moment when officially start to use
+        else: # Low speed and assisting here
+            # do i need the part of "if self.Assisting:" codes? may not
+            # because, the "Assisting" and The LS are the same way to send data, delete it?
+            # if self.Assisting:
+            #     self.sendUDP(data=self.shakeData + data, port=self.regular_port)
+            #     print('send Assisting')
+            #     self.Assisting = 0
+            if Timer.RunAfter( 'LSdefault_' + str( interval ) ):
+                print( 'low speed sent data: ',self.shakeData + data )
+                recvData=self.sendUDP(data=self.shakeData + data, port=self.regular_port, recv=1)
+                # recvData = self.verifyTCP(self.shakeData + data, self.regular_port,mode='halfduplex',autoClose=1)[1]
+                if recvData=='offlined':
+                    print ('received offlined')
+                    reset()
+
+            # else:
+                # send Lowspeed
+                # if self.RunAfter(self.ID + '_' + str(self.CLtime_ms + self.ran_CL)):
+            # self.sendUDP(data=self.shakeData + data, port=self.regularData_port)
+
+
+    def askshipSwitch(self):
+        self.switch.recvMSG( self.askShip() )
+
+    def Main(self):
+        if self.Ship:
+            self.switch.recvMSG( self.askShip() )
+        if self.Slot:
+            self.btn.link()
+
+
+
+    '''
+    def competition_client(self, checkin):
+        self.client_socket.settimeout( -1 )
+        data = self._recv_data( self.client_socket, self.online_len )
+        while data == 'B':
+            # not yet, count down, and make a beep for 5s
+            print( 'warning, MC check start after 5s' )
+            Timer.delayMS(5000)
+            while 1:
+                Timer.delayMS( 1000 )  # save energy than run_after
+                if checkin:
+                    self._send_data( self.client_socket, '1' )
+                    self.client_socket.settimeout( 0.2 )
+                    if self._recv_data( self.client_socket, self.online_len ) == 'W':
+                        print( 'winner' )
+                        self.client_socket.settimeout( 0 )
+                        data = '_'  # jump out the whole loop.
+                else:
+                    print( 'you out, waiting for next chance' )
+                    self.client_socket.settimeout( -1 )
+                    if self._recv_data( self.client_socket, self.online_len ) == 'B':
+                        break
+    '''
