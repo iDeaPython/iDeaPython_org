@@ -13,3 +13,5 @@ if ap.active():
 del (nic,ap)
 import gc
 gc.collect()
+
+#today
